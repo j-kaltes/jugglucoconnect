@@ -1118,6 +1118,11 @@ static bool putdescription(const char *input,int inputlen,std::string_view origi
     const int datalen=inputlen-sizeof(Agent_data);
     const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
     const int here= agent->getWhere();
+    if(agent->getLabel().size()<10) {
+        LOGGERALL("%s: putdescription label.size()=%d, side=%d totalsize=%d\n",name,agent->getLabel().size(),agent->getWhere(),agent->getDescription().size());
+         wrongpath({input,(size_t)inputlen},outdata);
+         return true;
+        }
     LOGGERALL("%s: putdescription label=%s, side=%d \n",name,agent->getLabel().data(),agent->getWhere(),agent->getDescription().size());
     LOGGER("%.*s\n",agent->getDescription().size(),agent->getDescription().data());
     uint32_t now=time(nullptr);
@@ -1188,6 +1193,12 @@ static bool getdescription(const char *input,int inputlen,std::string_view origi
         }
     const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
     const int here= agent->getWhere();
+    if(agent->getLabel().size()<10) {
+        LOGGERALL("%s: getdescription label.size()=%d, side=%d totalsize=%d\n",name,agent->getLabel().size(),agent->getWhere(),
+            agent->getDescription().size());
+         wrongpath({input,(size_t)inputlen},outdata);
+         return true;
+        }
     uint32_t wastime=time(nullptr);
     Connection_t *addr=alldata.makeEntry(agent,wastime);
     if(!addr) {
@@ -1254,6 +1265,11 @@ static bool putaddress(const char *input,int inputlen,std::string_view origin,re
         }
     const int datalen=inputlen-sizeof(Agent_data);
     const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    if(agent->getLabel().size()<10) {
+        LOGGERALL("%s: putaddress label.size()=%d, side=%d \n",name,agent->getLabel().size(),agent->getWhere());
+         wrongpath({input,(size_t)inputlen},outdata);
+         return true;
+        }
     const char *address=agent->getDescription().data();
     const int addresslen=agent->getDescription().size();
     uint32_t now=time(nullptr);
@@ -1280,6 +1296,11 @@ static bool putdone(const char *input,int inputlen,std::string_view origin,recda
         }
     const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
     bool here=agent->getWhere();
+    if(agent->getLabel().size()<10) {
+        LOGGERALL("%s: putdone label.size()=%d, side=%d \n",name,agent->getLabel().size(),here);
+         wrongpath({input,(size_t)inputlen},outdata);
+         return true;
+        }
     if(auto found=alldata.findEntry(agent)) {
         Connection_t &addr=*found;
         LOGGER("putdone label=%s side=%d wait_for()\n",agent->getLabel().data(),here);
@@ -1331,6 +1352,11 @@ static bool putfailure(const char *input,int inputlen,std::string_view origin,re
         }
     const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
     bool here=agent->getWhere();
+    if(agent->getLabel().size()<10) {
+        LOGGERALL("%s: putfailure label.size()=%d, side=%d \n",name,agent->getLabel().size(),here);
+         wrongpath({input,(size_t)inputlen},outdata);
+         return true;
+        }
     auto label=agent->getLabel();
     if(auto iter=alldata.findEntry(agent)) {
         Connection_t &addr=*iter;
@@ -1357,6 +1383,11 @@ static bool getaddress(const char *input,int inputlen,std::string_view origin,re
         return true;
         }
     const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    if(agent->getLabel().size()<10) {
+        LOGGERALL("%s: getaddress label.size()=%d, side=%d \n",name,agent->getLabel().size(),agent->getWhere(),agent->getDescription().size());
+         wrongpath({input,(size_t)inputlen},outdata);
+         return true;
+        }
     uint32_t now=time(nullptr);
     LOGGER("getaddress(%d,%.*s)\n",agent->getWhere(),agent->getLabel().size(),agent->getLabel().data());
     if(Connection_t *addr=alldata.getEntry(agent,now)) {
