@@ -26,10 +26,12 @@ struct keystring {
     ~keystring( ) {
         delete[] buf;
         }
-    template<typename Self>
-        auto *data(this Self &&self) {
-            return self.buf;
-            }
+    char *data() {
+        return buf;
+        }
+    const char *data() const {
+        return buf;
+        }
     size_t size() const {
         return buflen;
         }
@@ -46,4 +48,3 @@ struct keystring {
            return memcmp(buf,other.buf,buflen)>0;
           }
     };
-

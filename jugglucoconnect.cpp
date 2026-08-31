@@ -49,6 +49,8 @@
 #include <sys/syscall.h> 
 //#include <map>
 #include <chrono>
+#include <atomic>
+#include <memory>
 //#include <latch>
 
 #include "logs.hpp"
@@ -877,9 +879,9 @@ struct description_t:public address_t {
     std::queue<address_t> addresses;
     std::mutex mutex;
     std::condition_variable condi; 
-    bool finished=false;
+    std::atomic_bool finished{false};
     description_t():address_t(),finished(false) {
-        LOGGER("description_t finished=%d\n",finished);
+        LOGGER("description_t finished=%d\n",finished.load());
         }
     description_t(int s, const char *dat):address_t(s,dat),finished(false) {
         }
@@ -891,9 +893,8 @@ struct Connection_t {
 //    std::binary_semaphore done
     std::mutex mutex;
     std::condition_variable done; 
-    std::mutex erase_mutex;
     bool finished() const {   
-        return descriptions[0].finished&&descriptions[1].finished;
+        return descriptions[0].finished.load()&&descriptions[1].finished.load();
         }
     Connection_t() {}
     Connection_t(uint32_t now):unixtime(now){ }
@@ -917,15 +918,24 @@ struct KeyStringHash {
         return x==y;
     }
 };
-typedef tbb::concurrent_hash_map<const keystring, Connection_t,KeyStringHash>  BaseMap ;
+using ConnectionPtr=std::shared_ptr<Connection_t>;
+typedef tbb::concurrent_hash_map<const keystring, ConnectionPtr,KeyStringHash>  BaseMap ;
 class Alldata: public BaseMap  {
-template <typename Self,typename Accessor>
-bool   findEntry(this Self&&self,Accessor &a,const std::string_view label)  {
+template <typename Accessor>
+bool findEntry(Accessor &a,const std::string_view label)  {
         struct  {
             size_t len;
             const char *buf;
             } key{label.size(),label.data()};
-         return self.find(a,*reinterpret_cast<keystring*>(&key));
+         return BaseMap::find(a,*reinterpret_cast<keystring*>(&key));
+        }
+template <typename Accessor>
+bool findEntry(Accessor &a,const std::string_view label) const  {
+        struct  {
+            size_t len;
+            const char *buf;
+            } key{label.size(),label.data()};
+         return BaseMap::find(a,*reinterpret_cast<const keystring*>(&key));
         }
 public:
 /*
@@ -937,36 +947,34 @@ auto   findEntry(this Self&&self,const std::string_view label)  {
                } 
         return end;
         } */
-auto *  findEntry(const std::string_view label) const {
+ConnectionPtr findEntry(const std::string_view label) const {
         BaseMap::const_accessor a; 
         if(findEntry(a,label)) {
-               return &a->second;
+               return a->second;
                } 
-        return (const decltype(a->second)*)nullptr;
+        return {};
         } 
 
-auto *findEntry(const Agent_data *agent) {
-      auto *ret=const_cast<std::add_const<decltype(this)>::type>(this)->findEntry(agent->getLabel() );
-      return const_cast<std::remove_const<std::remove_pointer<decltype(ret)>::type>::type*>(ret);
+ConnectionPtr findEntry(const Agent_data *agent) const {
+      return findEntry(agent->getLabel());
       }
-auto *getEntry2(const std::string_view label,uint32_t now) const {
+ConnectionPtr getEntry2(const std::string_view label,uint32_t now) const {
      BaseMap::const_accessor search;  
      if(findEntry(search,label))   {
                LOGGER("getEntry(%.16s) success\n",label.data());
-                 return &search->second;
+                 return search->second;
                 }
       else  {
                LOGGER("getEntry(%.16s) failed\n",label.data());
-                return static_cast<decltype(&search->second)>(nullptr);
+                return {};
                 }
     }
     /*
 auto *getEntry(const std::string_view label,uint32_t now) const {
     return getEntry2(label,now);
     }*/
-auto *getEntry(const std::string_view label,uint32_t now) {
-      auto *ret=const_cast< std::add_const<decltype(this)>::type>(this)->getEntry2(label,now );
-      return const_cast< std::remove_const<std::remove_pointer<decltype(ret)>::type>::type *>(ret);
+ConnectionPtr getEntry(const std::string_view label,uint32_t now) const {
+      return getEntry2(label,now);
       }
       /*
 template <typename Self>
@@ -977,7 +985,7 @@ auto *getEntry(this Self&&self,const Agent_data *agent,uint32_t now)  {
 auto *getEntry(const Agent_data *agent,uint32_t now) const {
       return getEntry2(agent->getLabel(),now);
       } */
-auto *getEntry(const Agent_data *agent,uint32_t now)  {
+ConnectionPtr getEntry(const Agent_data *agent,uint32_t now) const {
       return getEntry(agent->getLabel(),now);
       }
       /*
@@ -987,43 +995,47 @@ auto *getEntry(const Agent_data *agent,uint32_t now) {
       } */
 //std::shared_mutex mutex;
 
-Connection_t *makeEntry(const std::string_view label,uint32_t now)  {
+ConnectionPtr makeEntry(const std::string_view label,uint32_t now)  {
      BaseMap::accessor a;  
      if(findEntry(a,label))   {
          LOGGER("old Item %s\n",label.data());
          }
       else  {
-         emplace(a,label,now);
+         emplace(a,label,std::make_shared<Connection_t>(now));
          LOGGER("addItem %s\n",label.data());
          }
 //     entry=&a->second;  
-     return &a->second;
+     return a->second;
      }
-auto *makeEntry(const Agent_data *agent,uint32_t now)  {
+ConnectionPtr makeEntry(const Agent_data *agent,uint32_t now)  {
       return makeEntry(agent->getLabel(),now);
       }
-Connection_t *putEntry(const std::string_view label,int where,const std::span<const char> description,uint32_t now)  {
-      auto *entry=makeEntry(label,now);
+ConnectionPtr putEntry(const std::string_view label,int where,const std::span<const char> description,uint32_t now)  {
+      auto entry=makeEntry(label,now);
       if(!entry||!entry->descriptions[where].empty()) {
-         eraseEntry(label);
+         eraseEntry(label,entry);
          return nullptr;
          }
       entry->descriptions[where].append(description.data(),description.size());
       LOGGER("putEntry size=%ld\n",description.size());
       return entry;
       };
-auto *putEntry(const Agent_data *agent,const int datalen,uint32_t now)  {
+ConnectionPtr putEntry(const Agent_data *agent,const int datalen,uint32_t now)  {
 //      return putEntry(agent->getLabel(),agent->getWhere(),{agent->getDescription(),(size_t)datalen},now);
       return putEntry(agent->getLabel(),agent->getWhere(),agent->getDescription(),now);
       }
 
 
-bool eraseEntry(const std::string_view label) {
+bool eraseEntry(const std::string_view label,const ConnectionPtr &expected) {
     int res;
     {
 //    std::lock_guard<std::shared_mutex> lck(mutex);
     BaseMap::accessor a;  
     if(find(a,label))  {
+        if(a->second!=expected) {
+            LOGGER("Keep newer %.16s\n",label.data());
+            return false;
+            }
         res= eraseOnly(a);
         LOGGER("Erased %.16s=%d\n",label.data(),res);
         }
@@ -1045,20 +1057,14 @@ constexpr bool erase(iterator it)  {
      return ret;
      }*/
      private:
-constexpr bool eraseOnly(BaseMap::accessor &a)  {
+bool eraseOnly(BaseMap::accessor &a)  {
     LOGAR("eraseOnly");
-    {
-    Connection_t &addr=a->second;
-//    std::lock_guard<std::mutex> lck(addr.erase_mutex);
-    addr.descriptions[0].clear();
-    addr.descriptions[1].clear();
-    addr.descriptions[0].finished=true;
-    addr.descriptions[1].finished=true;
-     addr.descriptions[0].condi.notify_all();
-     addr.descriptions[1].condi.notify_all();
-     addr.done.notify_all();
-     }
-     std::this_thread::sleep_for(5s);
+    ConnectionPtr addr=a->second;
+    addr->descriptions[0].finished=true;
+    addr->descriptions[1].finished=true;
+    addr->descriptions[0].condi.notify_all();
+    addr->descriptions[1].condi.notify_all();
+    addr->done.notify_all();
      BaseMap::erase(a);
      return true;
      }
@@ -1126,7 +1132,7 @@ static bool putdescription(const char *input,int inputlen,std::string_view origi
     LOGGERALL("%s: putdescription label=%s, side=%d \n",name,agent->getLabel().data(),agent->getWhere(),agent->getDescription().size());
     LOGGER("%.*s\n",agent->getDescription().size(),agent->getDescription().data());
     uint32_t now=time(nullptr);
-    Connection_t *addr=alldata.putEntry(agent,datalen,now);
+    auto addr=alldata.putEntry(agent,datalen,now);
     if(!addr) {
         LOGGERALL("%s: end putdescription description not present label=%s side=%d\n",name,agent->getLabel().data(),here);
         return givenothing(outdata);
@@ -1177,12 +1183,12 @@ static bool putdescription(const char *input,int inputlen,std::string_view origi
              return true;
              }
          else {
-            const bool res=alldata.eraseEntry(agent->getLabel());
+            const bool res=alldata.eraseEntry(agent->getLabel(),addr);
             LOGGERALL("%s end putdescription label=%s side=%d ERROR no data eraseEntry()=%d\\n",name,agent->getLabel().data(),here,res);
             return givenothing(outdata);
             }
          }
-    const bool res=alldata.eraseEntry(agent->getLabel());
+    const bool res=alldata.eraseEntry(agent->getLabel(),addr);
     LOGGERALL("%s end putdescription label=%s side=%d eraseEntry()=%d\n",name,agent->getLabel().data(),here,res);
     return givenothing(outdata);
     }
@@ -1200,7 +1206,7 @@ static bool getdescription(const char *input,int inputlen,std::string_view origi
          return true;
         }
     uint32_t wastime=time(nullptr);
-    Connection_t *addr=alldata.makeEntry(agent,wastime);
+    auto addr=alldata.makeEntry(agent,wastime);
     if(!addr) {
         LOGGERALL("%s: getdescription label=%s, side=%d addr==NULL: ERROR\n",name,agent->getLabel().data(),agent->getWhere());
          return givenothing(outdata);
@@ -1208,8 +1214,8 @@ static bool getdescription(const char *input,int inputlen,std::string_view origi
     LOGGERALL("%s: getdescription label=%s, side=%d \n",name,agent->getLabel().data(),agent->getWhere());
     auto &deshere=addr->descriptions[here];
     if(deshere.size()>0) {
-        const bool res=alldata.eraseEntry(agent->getLabel());
-        LOGGERALL("%s: getdescription label=%s side=%d eraseEntry()=%d already present\n",name,agent->getLabel().data(),here, res);
+        const bool res=alldata.eraseEntry(agent->getLabel(),addr);
+        LOGGERALL("%s: getdescription label=%s side=%d eraseEntry()=%d already present\n",name,agent->getLabel().data(),here,res);
         return givenothing(outdata);
         }
     int other=!here;
@@ -1253,7 +1259,7 @@ static bool getdescription(const char *input,int inputlen,std::string_view origi
             LOGGER("getdescription(%s) side=%d addr->descriptions[other].size()<=0 wait longer\n",agent->getLabel().data(),here);
             }
         }
-    const bool res=alldata.eraseEntry(agent->getLabel());
+    const bool res=alldata.eraseEntry(agent->getLabel(),addr);
     LOGGERALL("%s: end getdescription %s side=%d  eraseEntry()=%d nothing happens\n",name,agent->getLabel().data(),here, res);
     return givenothing(outdata);
     }
@@ -1273,7 +1279,7 @@ static bool putaddress(const char *input,int inputlen,std::string_view origin,re
     const char *address=agent->getDescription().data();
     const int addresslen=agent->getDescription().size();
     uint32_t now=time(nullptr);
-    if(Connection_t *addr=alldata.getEntry(agent,now)) {
+    if(auto addr=alldata.getEntry(agent,now)) {
         auto &desc=addr->descriptions[agent->getWhere()];
         LOGGER("putaddress(%.*s %.*s) side=%d success\n",agent->getLabel().size(),agent->getLabel().data(),addresslen,address,agent->getWhere());
         desc.addresses.emplace(addresslen,address);
@@ -1305,11 +1311,12 @@ static bool putdone(const char *input,int inputlen,std::string_view origin,recda
         Connection_t &addr=*found;
         LOGGER("putdone label=%s side=%d wait_for()\n",agent->getLabel().data(),here);
         auto &deshere=addr.descriptions[here];
-        if(deshere.compare(0,agent->getDescription().size(),agent->getDescription().data(), agent->getDescription().size())) {
+        const auto description=agent->getDescription();
+        if(deshere.size()!=description.size()||
+            memcmp(deshere.data(),description.data(),description.size())) {
             LOGGERN(deshere.data(),deshere.size());
             LOGGERN(agent->getDescription().data(),agent->getDescription().size());
-            bool res=alldata.eraseEntry(agent->getLabel());  
-            LOGGERALL("%s: side=%d %s end putdone: description different: storage!=agent eraseEntry=%d\n",name,here,agent->getLabel().data(),res);
+            LOGGERALL("%s: side=%d %s end putdone: stale description ignored\n",name,here,agent->getLabel().data());
             return givenothing(outdata);
             }
         bool finished=false;
@@ -1321,9 +1328,9 @@ static bool putdone(const char *input,int inputlen,std::string_view origin,recda
         }
         for(int i=0;i<10;++i) {
            { std::unique_lock<std::mutex> lck(addr.mutex);
-            addr.done.wait_for(lck,std::chrono::seconds(60),[&addr,agent,&check,&finished] {return (finished=(
+            addr.done.wait_for(lck,std::chrono::seconds(60),[&addr,found,agent,&check,&finished] {return (finished=(
 
-alldata.findEntry(agent)!=&addr||
+alldata.findEntry(agent)!=found||
 
             addr.finished()||!check.valid()));});   
             }
@@ -1334,7 +1341,7 @@ alldata.findEntry(agent)!=&addr||
                         continue;
                         }
                 }
-            bool res=alldata.eraseEntry(agent->getLabel());  
+            bool res=alldata.eraseEntry(agent->getLabel(),found);
             LOGGERALL("%s: putdone() %s side=%d erased %p res=%d\n",name,agent->getLabel().data(),here,&addr,res);
             return givenothing(outdata);
              }
@@ -1362,11 +1369,13 @@ static bool putfailure(const char *input,int inputlen,std::string_view origin,re
         Connection_t &addr=*iter;
         LOGGER("%d putfailure(%.*s) wait_for()\n",here,label.size(),label.data());
         auto &deshere=addr.descriptions[here];
-        if(memcmp(deshere.data(),agent->getDescription().data(), agent->getDescription().size())) {
+        const auto description=agent->getDescription();
+        if(deshere.size()!=description.size()||
+            memcmp(deshere.data(),description.data(),description.size())) {
             LOGGERALL("%s: putfailure %s side=%d  description different %s != %.*s\n",name,agent->getLabel().data(),here,deshere.data(),agent->getDescription().size(),agent->getDescription().data());
             }
         else {
-            bool res=alldata.eraseEntry(agent->getLabel());  
+            bool res=alldata.eraseEntry(agent->getLabel(),iter);
             LOGGERALL("%s: %d putfailure erase %s = %d\n",name,here,agent->getLabel().data(),res);
             }
         }
@@ -1390,7 +1399,7 @@ static bool getaddress(const char *input,int inputlen,std::string_view origin,re
         }
     uint32_t now=time(nullptr);
     LOGGER("getaddress(%d,%.*s)\n",agent->getWhere(),agent->getLabel().size(),agent->getLabel().data());
-    if(Connection_t *addr=alldata.getEntry(agent,now)) {
+    if(auto addr=alldata.getEntry(agent,now)) {
         auto &desc=addr->descriptions[!agent->getWhere()];
         auto &addresses=desc.addresses;
         LOGGER("%d: addresses.size()=%d\n", agent->getWhere(),addresses.size());
@@ -1430,7 +1439,7 @@ static bool getaddress(const char *input,int inputlen,std::string_view origin,re
                 }
 
             }
-        const bool res=alldata.eraseEntry(agent->getLabel());
+        const bool res=alldata.eraseEntry(agent->getLabel(),addr);
         LOGGER("getaddress(%.*s) side=%d eraseEntry()=%d\n",agent->getLabel().size(),agent->getLabel().data(),agent->getWhere(),res);
         wrongpath({input,(size_t)inputlen},outdata);
         return true;
