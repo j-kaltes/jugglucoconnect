@@ -4,6 +4,7 @@ services:
       context: .
     image: jugglucoconnect:local
     restart: unless-stopped
+    stop_grace_period: 3s
     read_only: true
     security_opt:
       - no-new-privileges:true
