@@ -8,3 +8,25 @@ The hostname (in double quotes) of the server should be set in Common/src/main/c
 For example:
 "servername.org"
 
+## Docker Compose deployment
+
+The server uses TLS on TCP port 6789. Put a readable certificate chain in
+`fullchain.pem` and its private key in `privkey.pem`, then run:
+
+```sh
+chgrp 65534 fullchain.pem privkey.pem
+chmod 640 fullchain.pem privkey.pem
+docker compose up -d --build
+```
+
+The container runs as UID and GID 65534. Both certificate files must be
+readable by that account. Compose refuses to start if either path is missing,
+so a typo cannot silently create a directory in place of a certificate file.
+The host firewall only needs TCP port 6789:
+
+```sh
+ufw allow 6789/tcp
+```
+
+TURN traffic does not pass through this service. A TURN server such as coturn
+still needs its own listener and relay ports.

@@ -1,0 +1,5 @@
+.git
+.gitignore
+*.o
+jugglucoconnect
+stale_generation_test
