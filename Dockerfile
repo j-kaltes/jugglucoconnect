@@ -11,7 +11,7 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY . .
-RUN make -j2 jugglucoconnect
+RUN make -j2 OPT=-O3 jugglucoconnect
 
 FROM debian:bookworm-slim
 

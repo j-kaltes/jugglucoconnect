@@ -22,6 +22,8 @@ docker compose up -d --build
 The container runs as UID and GID 65534. Both certificate files must be
 readable by that account. Compose refuses to start if either path is missing,
 so a typo cannot silently create a directory in place of a certificate file.
+The image disables the server's verbose SDP and ICE candidate logging, and
+Compose caps the remaining local container logs at two 1 MB files.
 The host firewall only needs TCP port 6789:
 
 ```sh
