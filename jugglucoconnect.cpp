@@ -904,7 +904,7 @@ struct Connection_t {
 //#include <unordered_map>
 #include <array>
 
-constexpr const uLong hashfunc(const char *d, int len) {
+uLong hashfunc(const char *d, int len) {
     return crc32(0,(const unsigned char*)d,len);
     }
 #include  "Agent_data.hpp"
