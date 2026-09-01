@@ -15,8 +15,8 @@ void startSSLonly();
 extern bool useSSL;
 int main(int argc,char **argv) {
    struct rlimit rl;
-   rl.rlim_cur = 100000;
-   rl.rlim_max = 100000;
+   rl.rlim_cur = 1024;
+   rl.rlim_max = 1024;
    if (setrlimit(RLIMIT_NPROC, &rl) < 0) {
        LOGGER("setrlimit(RLIMIT_NPROC failed %s\n",strerror(errno));
        }
@@ -37,7 +37,11 @@ int main(int argc,char **argv) {
      LOGGERALL("start %s, port=%d\n",argv[0],sslport);
     while(true) {
          auto error=startsslwatchwithoutthread();
-         LOGGERALL("startsslwatchwithoutthread()=%s\n",error.data());
+         // NOLOG intentionally suppresses request metadata, but operators must
+         // still be able to see that the TLS listener is unavailable.
+         loggert(error.empty()
+            ? "TLS listener stopped; retrying\n"
+            : "TLS listener unavailable; retrying\n");
          sleep(2);
         }
     }
