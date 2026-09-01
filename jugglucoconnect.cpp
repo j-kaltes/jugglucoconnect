@@ -450,6 +450,12 @@ static bool alloworigin(std::string_view origin) {
        return true;
    }
 
+static bool validHeaderValue(std::string_view value) {
+   return std::all_of(value.begin(),value.end(),[](unsigned char ch) {
+      return ch>=0x20&&ch!=0x7f;
+      });
+   }
+
 static bool mkhtml(recdata *outdata,std::string_view origin,std::string_view header,std::string_view bodyhtml,bool dark=false) {
     static constexpr const char startresponse[]="HTTP/1.1 200 OK";
     static constexpr const char allowheader[]="\r\nAccess-Control-Allow-Origin: ";
@@ -719,15 +725,15 @@ bool watchcommands(char *rbuf,int len,recdata *outdata,bool secure,valid_check &
          }
       else if(line.starts_with("Origin: ")) {
          origin=line.substr(sizeof("Origin: ")-1);
-         if(origin.size()>512) {
-            wrongpath("origin too long",outdata);
+         if(origin.size()>512||!validHeaderValue(origin)) {
+            wrongpath("invalid origin",outdata);
             return false;
             }
          }
       else if(line.starts_with("Host: ")) {
          hostname=line.substr(sizeof("Host: ")-1);
-         if(hostname.size()>512) {
-            wrongpath("host too long",outdata);
+         if(hostname.size()>512||!validHeaderValue(hostname)) {
+            wrongpath("invalid host",outdata);
             return false;
             }
          }
@@ -1040,7 +1046,8 @@ ConnectionPtr makeEntry(const std::string_view label,uint32_t now)  {
             return {};
             }
          try {
-            emplace(a,label,std::make_shared<Connection_t>(now));
+            if(!emplace(a,label,std::make_shared<Connection_t>(now)))
+               entry_count.fetch_sub(1,std::memory_order_release);
             }
          catch(...) {
             entry_count.fetch_sub(1,std::memory_order_release);

@@ -107,6 +107,40 @@ int main() {
     assert(!watchcommands(mismatched_length.data(),
         static_cast<int>(mismatched_length.size()),&response,true,check,"test"));
     release_response(response);
+
+    std::string invalid_origin="GET / HTTP/1.1\r\nOrigin: https://example.test\rInjected: value\nContent-Length: 0\r\n\r\n";
+    assert(!watchcommands(invalid_origin.data(),
+        static_cast<int>(invalid_origin.size()),&response,true,check,"test"));
+    release_response(response);
+
+    constexpr std::string_view race_label="same-label-race";
+    std::vector<ConnectionPtr> raced_entries(32);
+    std::vector<std::thread> creators;
+    for(size_t index=0;index<raced_entries.size();++index) {
+        creators.emplace_back([&,index] {
+            raced_entries[index]=alldata.makeEntry(race_label,3);
+        });
+    }
+    for(auto &creator:creators)
+        creator.join();
+    for(const auto &entry:raced_entries)
+        assert(entry&&entry==raced_entries.front());
+
+    std::vector<std::string> capacity_labels;
+    std::vector<ConnectionPtr> capacity_entries;
+    capacity_labels.reserve(128);
+    capacity_entries.reserve(127);
+    for(int index=0;index<127;++index) {
+        capacity_labels.push_back("capacity-label-"+std::to_string(index));
+        auto entry=alldata.makeEntry(capacity_labels.back(),4);
+        assert(entry);
+        capacity_entries.push_back(std::move(entry));
+    }
+    assert(!alldata.makeEntry("capacity-overflow",4));
+    assert(alldata.eraseEntry(race_label,raced_entries.front()));
+    for(size_t index=0;index<capacity_entries.size();++index)
+        assert(alldata.eraseEntry(capacity_labels[index],capacity_entries[index]));
+
     Agent_data::deleteAgent(valid);
     return 0;
 }

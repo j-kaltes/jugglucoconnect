@@ -37,7 +37,11 @@ int main(int argc,char **argv) {
      LOGGERALL("start %s, port=%d\n",argv[0],sslport);
     while(true) {
          auto error=startsslwatchwithoutthread();
-         LOGGERALL("startsslwatchwithoutthread()=%s\n",error.data());
+         // NOLOG intentionally suppresses request metadata, but operators must
+         // still be able to see that the TLS listener is unavailable.
+         loggert(error.empty()
+            ? "TLS listener stopped; retrying\n"
+            : "TLS listener unavailable; retrying\n");
          sleep(2);
         }
     }
