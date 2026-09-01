@@ -134,6 +134,7 @@ static bool startwebserver(bool secure,int port,int *sockptr) {
 
 #include <thread>
 #include <algorithm>
+#include <atomic>
 
 #define _GNU_SOURCE 1
 #include <sched.h>
@@ -142,6 +143,13 @@ static int xdripserversock=-1;
 static int xdripserversslsock=-1;
 
 static bool stopconnection=false;
+static constexpr int max_active_handlers=128;
+static std::atomic<int> active_handlers{0};
+
+class handler_slot {
+public:
+   ~handler_slot() { active_handlers.fetch_sub(1,std::memory_order_release); }
+};
 
 #ifdef USE_SSL
 extern bool sslstopconnection;
@@ -289,26 +297,35 @@ static void webserverloop(int *sockptr,bool secure)  {
       const namehost name(addrptr);
       const char * namestr=name;
      LOGGER("%swebserver: got connection from %s sock=%d\n" ,secure?"secure":"",namestr ,new_fd);
+      if(active_handlers.fetch_add(1,std::memory_order_acq_rel)>=max_active_handlers) {
+         active_handlers.fetch_sub(1,std::memory_order_release);
+         shutdown(new_fd,SHUT_RDWR);
+         close(new_fd);
+         continue;
+         }
       void handlewatch(int sock,const namehost) ;
       try {
-          if(secure) {
-            void handlewatchsecure(int sock,const namehost) ;
-             sslstopconnection=false;
-             std::thread  handlecon(handlewatchsecure,new_fd,name);
-              handlecon.detach();
-             }
-          else 
-          {
-             stopconnection=false;
-             std::thread  handlecon(handlewatch,new_fd,name);
-             handlecon.detach();
-             }
+          std::thread handlecon([secure,new_fd,name] {
+             handler_slot slot;
+             if(secure) {
+                void handlewatchsecure(int sock,const namehost);
+                sslstopconnection=false;
+                handlewatchsecure(new_fd,name);
+                }
+             else {
+                stopconnection=false;
+                handlewatch(new_fd,name);
+                }
+             });
+          handlecon.detach();
           }
       catch (const std::exception& e)     {
+           active_handlers.fetch_sub(1,std::memory_order_release);
            LOGGER("exception %s close(%d)\n",e.what(),new_fd );
            close(new_fd);
           }
       catch (...)     {
+         active_handlers.fetch_sub(1,std::memory_order_release);
          LOGGER("exception close(%d)\n",new_fd);
          close(new_fd);
         }
@@ -419,18 +436,6 @@ static bool plainwatchcommands(int sock,const char *host) {
 
    if(stopconnection)
       return false;
-   if(writeall(
-#ifdef __ANDROID_API__
-   "/data/local/tmp/web/input.dat"
-#else
-   "/tmp/input.dat"
-#endif
-   ,rbuf,len)) {
-      LOGGER("write succeeded\n");
-      }
-   else
-      LOGGER("write failed\n");
-
    raw_check check(sock);
    bool res=watchcommands(rbuf, len,&outdata,false,check,host); 
    bool res2=sendall( sock ,outdata.data(),outdata.size()) ;
@@ -481,9 +486,7 @@ static bool mkhtml(recdata *outdata,std::string_view origin,std::string_view hea
     addar(endptr,contentlength);
     endptr+=sprintf(endptr,"%d",weblen);
     addar(endptr,seperator);
-    #ifndef NOLOG
     const char *startpage=endptr;
-    #endif
     addar(endptr,prehead);
     addstrview(endptr,header);
     if(dark) {
@@ -641,106 +644,129 @@ static bool putaddress(const char *input,int inputlen,std::string_view origin,re
 static bool putdone(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *host) ;
 static bool putfailure(const char *input,int inputlen,std::string_view origin,recdata *outdata,const char *host) ;
 bool watchcommands(char *rbuf,int len,recdata *outdata,bool secure,valid_check &check,const char *host) {
-   LOGGER("watchcommands len=%d %.*s\n",len,len,rbuf);
-   const char *start=rbuf;
-   const char *ends=rbuf+len;
-   const char *nl;
+   static constexpr size_t max_request_size=4096;
+   if(!rbuf||len<0||static_cast<size_t>(len)>max_request_size) {
+      wrongpath("invalid request",outdata);
+      return false;
+      }
+   const std::string_view request(rbuf,static_cast<size_t>(len));
+   size_t header_end=request.find("\r\n\r\n");
+   size_t delimiter_size=4;
+   if(header_end==std::string_view::npos) {
+      header_end=request.find("\n\n");
+      delimiter_size=2;
+      }
+   if(header_end==std::string_view::npos) {
+      wrongpath("incomplete request",outdata);
+      return false;
+      }
+   const size_t body_start=header_end+delimiter_size;
    std::string_view toget;
+   std::string_view hostname,origin;
    bool beput=false;
-   bool json=false;
-   const char reget[]= "GET /";
-   const int regetlen=sizeof(reget)-1;
-   const char reput[]= "PUT /";
-   const int reputlen=sizeof(reput)-1;
-   int length=0;
-   std::string_view hostname,origin,referer;
-   while((nl= std::find(start,ends,'\n'))!=ends) {
-      if(!memcmp(start,reget,regetlen)) {
-         const char *reststart=start+regetlen;
-         toget={reststart,(std::string_view::size_type)(nl-reststart)};
-         }
-      else {
-         if(!memcmp(start,reput,reputlen)) {
-            const char *reststart=start+reputlen;
-            toget={reststart,(std::string_view::size_type)(nl-reststart)};
+   bool have_request_line=false;
+   bool have_content_length=false;
+   size_t content_length=0;
+   size_t line_start=0;
+   while(line_start<header_end) {
+      size_t line_end=request.find('\n',line_start);
+      if(line_end==std::string_view::npos||line_end>header_end)
+         line_end=header_end;
+      std::string_view line=request.substr(line_start,line_end-line_start);
+      if(!line.empty()&&line.back()=='\r')
+         line.remove_suffix(1);
+      if(!have_request_line) {
+         have_request_line=true;
+         constexpr std::string_view get_prefix="GET /";
+         constexpr std::string_view put_prefix="PUT /";
+         size_t path_start=0;
+         if(line.starts_with(get_prefix))
+            path_start=get_prefix.size();
+         else if(line.starts_with(put_prefix)) {
+            path_start=put_prefix.size();
             beput=true;
             }
          else {
-              constexpr const char lengthstr[]{R"(Content-Length: )"};
-              constexpr const int lengthlen=sizeof(lengthstr)-1;
-              if(!memcmp(start,lengthstr,lengthlen)) {
-                  sscanf(start+lengthlen,"%d",&length);
-                  }
-              else { 
-                   constexpr const char jsonstr[]=R"(Accept: application/json)";
-                   if(!memcmp(start,jsonstr,sizeof(jsonstr)-1)) {
-                      json=true;
-                      LOGAR("Accepts json");
-                      }
-                   else {
-                      {
-                      constexpr const char originnamestr[]="Origin: ";
-                      constexpr const int originnamelen= sizeof(originnamestr)-1;
-                      if(!memcmp(start,originnamestr,originnamelen)) {
-                         const char *name=start+originnamelen;
-                         origin={name,static_cast<size_t>(nl-name-(nl[-1]==0x0D?1:0))};
-                         LOGGER("Origin=%.*s\n",(int)origin.size(),origin.data());
-                         }
-                      else
-                          {
-                         constexpr const char hostnamestr[]="Host: ";
-                         constexpr const int hostnamelen= sizeof(hostnamestr)-1;
-                         if(!memcmp(start,hostnamestr,hostnamelen)) {
-                            const char *name=start+hostnamelen;
-                               
-                            hostname={name,static_cast<size_t>(nl-name-(nl[-1]==0x0D?1:0))};
-                            }
-                           }
-                           }
-                      }
-                  }
+            wrongpath("invalid method",outdata);
+            return false;
+            }
+         const size_t path_end=line.find(' ',path_start);
+         if(path_end==std::string_view::npos) {
+            wrongpath("invalid request line",outdata);
+            return false;
+            }
+         toget=line.substr(path_start,path_end-path_start);
+         }
+      else if(line.starts_with("Content-Length:")) {
+         if(have_content_length) {
+            wrongpath("duplicate content length",outdata);
+            return false;
+            }
+         std::string_view value=line.substr(sizeof("Content-Length:")-1);
+         while(!value.empty()&&(value.front()==' '||value.front()=='\t'))
+            value.remove_prefix(1);
+         while(!value.empty()&&(value.back()==' '||value.back()=='\t'))
+            value.remove_suffix(1);
+         size_t parsed_length=0;
+         const auto parsed=std::from_chars(value.data(),value.data()+value.size(),parsed_length);
+         if(value.empty()||parsed.ec!=std::errc()||parsed.ptr!=value.data()+value.size()||
+            parsed_length>max_request_size) {
+            wrongpath("invalid content length",outdata);
+            return false;
+            }
+         content_length=parsed_length;
+         have_content_length=true;
+         }
+      else if(line.starts_with("Origin: ")) {
+         origin=line.substr(sizeof("Origin: ")-1);
+         if(origin.size()>512) {
+            wrongpath("origin too long",outdata);
+            return false;
             }
          }
-      start=nl+1;
-      if(*start==0xD||*start=='\n')
-         break;
+      else if(line.starts_with("Host: ")) {
+         hostname=line.substr(sizeof("Host: ")-1);
+         if(hostname.size()>512) {
+            wrongpath("host too long",outdata);
+            return false;
+            }
+         }
+      line_start=line_end+1;
       }
-   
-   if(!toget.data()) {
+   if(!have_content_length)
+      content_length=0;
+   if(body_start>request.size()||content_length!=request.size()-body_start) {
+      wrongpath("request body length mismatch",outdata);
+      return false;
+      }
+   if(!have_request_line) {
       LOGGERALL("%s: empty connect\n",host);
       givenothing(outdata);
       return false;
       }
-   if(!toget.size()||*toget.data()==' '||*toget.data()=='?') {
+   if(toget.empty()||toget.front()=='?') {
       LOGGERALL("%s: no path\n",host);
       givesite(outdata,hostname,secure);
       return true;
       }
-  // LOGGER("toget=%.*s\n",(int)toget.size(),toget.data()); //to set getargs in the beginning and use everywhere
-    constexpr const char description[]="description";
-    constexpr const int descriptionlen=sizeof(description)-1;
-    if(!memcmp(description,toget.data(),descriptionlen)) {
-            return (beput?putdescription:getdescription)(ends-length,length,origin,outdata,check,host);
+   const char *body=rbuf+body_start;
+   const int body_length=static_cast<int>(content_length);
+    if(toget=="description") {
+            return (beput?putdescription:getdescription)(body,body_length,origin,outdata,check,host);
         }
-    constexpr const char address[]="address";
-    constexpr const int addresslen=sizeof(address)-1;
-    if(!memcmp(address,toget.data(),addresslen)) {
+    if(toget=="address") {
         if(beput)
-            return putaddress(ends-length,length,origin,outdata,host);
+            return putaddress(body,body_length,origin,outdata,host);
          else
-            return getaddress(ends-length,length,origin,outdata,check,host);
+            return getaddress(body,body_length,origin,outdata,check,host);
         }
-    constexpr const char done[]="done";
-    constexpr const int donelen=sizeof(done)-1;
-    if(!memcmp(done,toget.data(),donelen)) {
+    if(toget=="done") {
         if(beput)
-            return putdone(ends-length,length,origin,outdata,check,host);
+            return putdone(body,body_length,origin,outdata,check,host);
         }
-    constexpr const char failure[]="failure";
-    constexpr const int failurelen=sizeof(failure)-1;
-    if(!memcmp(failure,toget.data(),failurelen)) {
+    if(toget=="failure") {
         if(beput)
-            return putfailure(ends-length,length,origin,outdata,host);
+            return putfailure(body,body_length,origin,outdata,host);
         }
    LOGGERALL("%s: wrong path %.*s\n",host,toget.size(),toget.data());
    wrongpath(toget,outdata);
@@ -921,6 +947,8 @@ struct KeyStringHash {
 using ConnectionPtr=std::shared_ptr<Connection_t>;
 typedef tbb::concurrent_hash_map<const keystring, ConnectionPtr,KeyStringHash>  BaseMap ;
 class Alldata: public BaseMap  {
+static constexpr size_t max_active_labels=128;
+std::atomic<size_t> entry_count{0};
 template <typename Accessor>
 bool findEntry(Accessor &a,const std::string_view label)  {
         struct  {
@@ -958,6 +986,9 @@ ConnectionPtr findEntry(const std::string_view label) const {
 ConnectionPtr findEntry(const Agent_data *agent) const {
       return findEntry(agent->getLabel());
       }
+ConnectionPtr findEntry(const AgentView *agent) const {
+      return findEntry(agent->getLabel());
+      }
 ConnectionPtr getEntry2(const std::string_view label,uint32_t now) const {
      BaseMap::const_accessor search;  
      if(findEntry(search,label))   {
@@ -988,6 +1019,9 @@ auto *getEntry(const Agent_data *agent,uint32_t now) const {
 ConnectionPtr getEntry(const Agent_data *agent,uint32_t now) const {
       return getEntry(agent->getLabel(),now);
       }
+ConnectionPtr getEntry(const AgentView *agent,uint32_t now) const {
+      return getEntry(agent->getLabel(),now);
+      }
       /*
 auto *getEntry(const Agent_data *agent,uint32_t now) {
       auto *ret=reinterpret_cast<std::add_const<decltype(this)>::type>(this)->getEntry(agent->getLabel(),now );
@@ -1001,13 +1035,26 @@ ConnectionPtr makeEntry(const std::string_view label,uint32_t now)  {
          LOGGER("old Item %s\n",label.data());
          }
       else  {
-         emplace(a,label,std::make_shared<Connection_t>(now));
+         if(entry_count.fetch_add(1,std::memory_order_acq_rel)>=max_active_labels) {
+            entry_count.fetch_sub(1,std::memory_order_release);
+            return {};
+            }
+         try {
+            emplace(a,label,std::make_shared<Connection_t>(now));
+            }
+         catch(...) {
+            entry_count.fetch_sub(1,std::memory_order_release);
+            throw;
+            }
          LOGGER("addItem %s\n",label.data());
          }
 //     entry=&a->second;  
      return a->second;
      }
 ConnectionPtr makeEntry(const Agent_data *agent,uint32_t now)  {
+      return makeEntry(agent->getLabel(),now);
+      }
+ConnectionPtr makeEntry(const AgentView *agent,uint32_t now)  {
       return makeEntry(agent->getLabel(),now);
       }
 ConnectionPtr putEntry(const std::string_view label,int where,const std::span<const char> description,uint32_t now)  {
@@ -1022,6 +1069,9 @@ ConnectionPtr putEntry(const std::string_view label,int where,const std::span<co
       };
 ConnectionPtr putEntry(const Agent_data *agent,const int datalen,uint32_t now)  {
 //      return putEntry(agent->getLabel(),agent->getWhere(),{agent->getDescription(),(size_t)datalen},now);
+      return putEntry(agent->getLabel(),agent->getWhere(),agent->getDescription(),now);
+      }
+ConnectionPtr putEntry(const AgentView *agent,uint32_t now)  {
       return putEntry(agent->getLabel(),agent->getWhere(),agent->getDescription(),now);
       }
 
@@ -1065,8 +1115,9 @@ bool eraseOnly(BaseMap::accessor &a)  {
     addr->descriptions[0].condi.notify_all();
     addr->descriptions[1].condi.notify_all();
     addr->done.notify_all();
-     BaseMap::erase(a);
-     return true;
+    BaseMap::erase(a);
+    entry_count.fetch_sub(1,std::memory_order_release);
+    return true;
      }
    };
 Alldata alldata;
@@ -1116,13 +1167,13 @@ int fd_valid(int sockfd) {
   return true;
 }  */
 static bool putdescription(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *name) {
-    if(inputlen<(sizeof(Agent_data)+20)) {
-         LOGGERALL("%s: putdescription(%.*s,%d) too small\n",name,inputlen,input,inputlen);
+    const auto parsed=AgentView::parse({input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed) {
+         LOGGERALL("%s: putdescription invalid request\n",name);
          wrongpath({input,(size_t)inputlen},outdata);
           return true;
         }
-    const int datalen=inputlen-sizeof(Agent_data);
-    const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    const AgentView *agent=&*parsed;
     const int here= agent->getWhere();
     if(agent->getLabel().size()<10) {
         LOGGERALL("%s: putdescription label.size()=%d, side=%d totalsize=%d\n",name,agent->getLabel().size(),agent->getWhere(),agent->getDescription().size());
@@ -1132,7 +1183,7 @@ static bool putdescription(const char *input,int inputlen,std::string_view origi
     LOGGERALL("%s: putdescription label=%s, side=%d \n",name,agent->getLabel().data(),agent->getWhere(),agent->getDescription().size());
     LOGGER("%.*s\n",agent->getDescription().size(),agent->getDescription().data());
     uint32_t now=time(nullptr);
-    auto addr=alldata.putEntry(agent,datalen,now);
+    auto addr=alldata.putEntry(agent,now);
     if(!addr) {
         LOGGERALL("%s: end putdescription description not present label=%s side=%d\n",name,agent->getLabel().data(),here);
         return givenothing(outdata);
@@ -1193,11 +1244,12 @@ static bool putdescription(const char *input,int inputlen,std::string_view origi
     return givenothing(outdata);
     }
 static bool getdescription(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *name) {
-    if(inputlen<(sizeof(Agent_data))) {
-         LOGGERALL("%s: getdescription(%.*s,%d) too small: ERROR\n" ,name,inputlen,input,inputlen);
+    const auto parsed=AgentView::parse({input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed) {
+         LOGGERALL("%s: getdescription invalid request\n",name);
          return givenothing(outdata);
         }
-    const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    const AgentView *agent=&*parsed;
     const int here= agent->getWhere();
     if(agent->getLabel().size()<10) {
         LOGGERALL("%s: getdescription label.size()=%d, side=%d totalsize=%d\n",name,agent->getLabel().size(),agent->getWhere(),
@@ -1264,13 +1316,13 @@ static bool getdescription(const char *input,int inputlen,std::string_view origi
     return givenothing(outdata);
     }
 static bool putaddress(const char *input,int inputlen,std::string_view origin,recdata *outdata,const char *name) {
-    if(inputlen<(sizeof(Agent_data)+20)) {
-         LOGGER("putaddress(%.*s,%d) too small\n",inputlen,input,inputlen);
+    const auto parsed=AgentView::parse({input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed) {
+         LOGGER("putaddress invalid request\n");
          wrongpath({input,(size_t)inputlen},outdata);
           return true;
         }
-    const int datalen=inputlen-sizeof(Agent_data);
-    const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    const AgentView *agent=&*parsed;
     if(agent->getLabel().size()<10) {
         LOGGERALL("%s: putaddress label.size()=%d, side=%d \n",name,agent->getLabel().size(),agent->getWhere());
          wrongpath({input,(size_t)inputlen},outdata);
@@ -1282,8 +1334,11 @@ static bool putaddress(const char *input,int inputlen,std::string_view origin,re
     if(auto addr=alldata.getEntry(agent,now)) {
         auto &desc=addr->descriptions[agent->getWhere()];
         LOGGER("putaddress(%.*s %.*s) side=%d success\n",agent->getLabel().size(),agent->getLabel().data(),addresslen,address,agent->getWhere());
-        desc.addresses.emplace(addresslen,address);
         std::lock_guard<std::mutex> lck(desc.mutex);
+        static constexpr size_t max_pending_addresses=64;
+        if(desc.addresses.size()>=max_pending_addresses)
+            return givenothing(outdata);
+        desc.addresses.emplace(addresslen,address);
         desc.condi.notify_all();
         return givenothing(outdata);
         }
@@ -1295,12 +1350,13 @@ static bool putaddress(const char *input,int inputlen,std::string_view origin,re
     }
 
 static bool putdone(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *name) {
-    if(inputlen<(sizeof(Agent_data)+20)) {
-         LOGGERALL("%s: putdone(%.*s,%d) too small\n",name,inputlen,input,inputlen);
+    const auto parsed=AgentView::parse({input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed) {
+         LOGGERALL("%s: putdone invalid request\n",name);
          wrongpath({input,(size_t)inputlen},outdata);
          return true;
         }
-    const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    const AgentView *agent=&*parsed;
     bool here=agent->getWhere();
     if(agent->getLabel().size()<10) {
         LOGGERALL("%s: putdone label.size()=%d, side=%d \n",name,agent->getLabel().size(),here);
@@ -1353,11 +1409,12 @@ alldata.findEntry(agent)!=found||
     }
 
 static bool putfailure(const char *input,int inputlen,std::string_view origin,recdata *outdata,const char *name)  {
-    if(inputlen<(sizeof(Agent_data))) {
-         LOGGERALL("%s: putfailure(%.*s,%d) too small\n",name,inputlen,input,inputlen);
+    const auto parsed=AgentView::parse({input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed) {
+         LOGGERALL("%s: putfailure invalid request\n",name);
         return givenothing(outdata);
         }
-    const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    const AgentView *agent=&*parsed;
     bool here=agent->getWhere();
     if(agent->getLabel().size()<10) {
         LOGGERALL("%s: putfailure label.size()=%d, side=%d \n",name,agent->getLabel().size(),here);
@@ -1386,12 +1443,13 @@ static bool putfailure(const char *input,int inputlen,std::string_view origin,re
     }
 
 static bool getaddress(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *name) {
-    if(inputlen<sizeof(Agent_data )) {
-        LOGGER("getaddress(%.*s,%d) too small\n",inputlen,input,inputlen);
+    const auto parsed=AgentView::parse({input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed) {
+        LOGGER("getaddress invalid request\n");
         wrongpath({input,(size_t)inputlen},outdata);
         return true;
         }
-    const Agent_data *agent=reinterpret_cast<const Agent_data *>(input);
+    const AgentView *agent=&*parsed;
     if(agent->getLabel().size()<10) {
         LOGGERALL("%s: getaddress label.size()=%d, side=%d \n",name,agent->getLabel().size(),agent->getWhere(),agent->getDescription().size());
          wrongpath({input,(size_t)inputlen},outdata);
@@ -1406,23 +1464,23 @@ static bool getaddress(const char *input,int inputlen,std::string_view origin,re
         bool invalid=false;
         bool changed=false;
         for(int i=0;i<10;++i) {
-           {
             std::unique_lock<std::mutex> lck(desc.mutex);
             desc.condi.wait_for(lck, std::chrono::seconds(60), [&addresses,addr,&check,&invalid,agent,&changed] {
                 if((changed=alldata.findEntry(agent)!=addr))
                     return true; 
                 bool fin= addr->finished();
                 LOGGER("getaddress %s side=%d fin=%d\n",agent->getLabel().data(),agent->getWhere(),fin);
-                return !addresses.empty()|| (invalid=(fin||!check.valid())) ;});   
-            }
+                return !addresses.empty()|| (invalid=(fin||!check.valid())) ;});
             if(changed) {
                 LOGGER("getaddress finished %d\n",agent->getWhere());
                 return givenothing(outdata);
                 }
             if(!addresses.empty()) { 
                 uint32_t oldtime=addr->unixtime;
-                makeBackdescription(addresses.front(), oldtime,origin,outdata);
+                address_t next=std::move(addresses.front());
                 addresses.pop();
+                lck.unlock();
+                makeBackdescription(next, oldtime,origin,outdata);
                 return true;
                 }
              else {

@@ -5,6 +5,9 @@ services:
     image: jugglucoconnect:local
     restart: unless-stopped
     stop_grace_period: 3s
+    pids_limit: 256
+    mem_limit: 256m
+    cpus: 1.0
     read_only: true
     security_opt:
       - no-new-privileges:true

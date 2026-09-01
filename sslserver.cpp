@@ -23,9 +23,14 @@ char privatekey[]="privkey.pem";
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <algorithm>
 #include <string>
+#include <charconv>
+#include <chrono>
 #include <signal.h>
 #include <string_view>
+#include <span>
+#include <vector>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -351,34 +356,113 @@ struct ssl_check:public valid_check {
            }
        }
   };
+
+extern void sendtimeout(int sock,int secs);
+extern void receivetimeout(int sock,int secs);
+
+namespace {
+constexpr size_t max_secure_request_size=4096;
+constexpr auto secure_request_deadline=std::chrono::seconds(12);
+
+enum class frame_state { incomplete, complete, invalid };
+struct frame_result {
+    frame_state state;
+    size_t expected_size;
+};
+
+frame_result inspect_request_frame(std::span<const char> bytes) {
+    if(bytes.size()>max_secure_request_size)
+        return {frame_state::invalid,0};
+    const std::string_view request(bytes.data(),bytes.size());
+    size_t header_end=request.find("\r\n\r\n");
+    size_t delimiter_size=4;
+    if(header_end==std::string_view::npos) {
+        header_end=request.find("\n\n");
+        delimiter_size=2;
+        }
+    if(header_end==std::string_view::npos)
+        return {frame_state::incomplete,0};
+    const size_t body_start=header_end+delimiter_size;
+    bool have_length=false;
+    size_t content_length=0;
+    size_t line_start=0;
+    bool first=true;
+    while(line_start<header_end) {
+        size_t line_end=request.find('\n',line_start);
+        if(line_end==std::string_view::npos||line_end>header_end)
+            line_end=header_end;
+        std::string_view line=request.substr(line_start,line_end-line_start);
+        if(!line.empty()&&line.back()=='\r')
+            line.remove_suffix(1);
+        if(first)
+            first=false;
+        else if(line.starts_with("Content-Length:")) {
+            if(have_length)
+                return {frame_state::invalid,0};
+            std::string_view value=line.substr(sizeof("Content-Length:")-1);
+            while(!value.empty()&&(value.front()==' '||value.front()=='\t'))
+                value.remove_prefix(1);
+            while(!value.empty()&&(value.back()==' '||value.back()=='\t'))
+                value.remove_suffix(1);
+            const auto parsed=std::from_chars(value.data(),value.data()+value.size(),content_length);
+            if(value.empty()||parsed.ec!=std::errc()||parsed.ptr!=value.data()+value.size())
+                return {frame_state::invalid,0};
+            have_length=true;
+            }
+        line_start=line_end+1;
+        }
+    if(content_length>max_secure_request_size-body_start)
+        return {frame_state::invalid,0};
+    const size_t expected=body_start+content_length;
+    if(bytes.size()<expected)
+        return {frame_state::incomplete,expected};
+    return {bytes.size()==expected?frame_state::complete:frame_state::invalid,expected};
+}
+
+bool read_secure_request(SSL *ssl,std::vector<char> &request) {
+    request.clear();
+    request.reserve(max_secure_request_size);
+    const int sock=SSL_get_fdptr(ssl);
+    const auto deadline=std::chrono::steady_clock::now()+secure_request_deadline;
+    while(request.size()<max_secure_request_size) {
+        const auto now=std::chrono::steady_clock::now();
+        if(now>=deadline)
+            return false;
+        const auto remaining=std::chrono::duration_cast<std::chrono::seconds>(deadline-now);
+        receivetimeout(sock,std::max(1,static_cast<int>(remaining.count()+1)));
+        char chunk[1024];
+        const int capacity=static_cast<int>(
+            std::min(sizeof(chunk),max_secure_request_size-request.size()));
+        const int got=SSL_readptr(ssl,chunk,capacity);
+        if(got<=0) {
+            const int error=SSL_get_errorptr(ssl,got);
+            if(error==SSL_ERROR_WANT_READ||error==SSL_ERROR_WANT_WRITE)
+                continue;
+            return false;
+            }
+        request.insert(request.end(),chunk,chunk+got);
+        const auto frame=inspect_request_frame({request.data(),request.size()});
+        if(frame.state==frame_state::complete)
+            return true;
+        if(frame.state==frame_state::invalid)
+            return false;
+        }
+    return false;
+}
+}
+
 bool securewatchcommands(SSL *ssl,const char *host) {
-    constexpr const int RBUFSIZE=4096;
-    char rbuf[RBUFSIZE];
-    int len;
-    if((len= SSL_readptr(ssl, rbuf,RBUFSIZE))<=0) {
+    std::vector<char> request;
+    if(!read_secure_request(ssl,request)) {
         sslservererror(ssl);
         return false;
         }
-   // LOGGER("securewatchcommands len=%d\n",len);
     struct recdata outdata;
     if(sslstopconnection)
         return false;
     bool watchcommands(char *rbuf,int len,recdata *outdata,bool secure, valid_check &check,const char*) ;
-#ifndef NOLOG
-    if(writeall(
-#ifdef __ANDROID_API__
-   "/data/local/tmp/web/input.dat"
-#else
-   "/tmp/input.dat"
-#endif
-    ,rbuf,len)) {
-    //   LOGGER("write succeeded\n");
-       }
-    else
-       LOGGER("write failed\n");
-#endif
     ssl_check check(ssl);
-    bool res=watchcommands(rbuf, len,&outdata,true,check,host);
+    bool res=watchcommands(request.data(),static_cast<int>(request.size()),&outdata,true,check,host);
     int res2=  SSL_writeptr(ssl,outdata.data(),outdata.size());
    LOGGER("securewatchcommands: delete outdata.allbuf=%p\n",outdata.allbuf);
     delete[] outdata.allbuf;
@@ -468,8 +552,8 @@ try {
         SSL_freeptr(ssl);  
 #endif
         }};
-//   receivetimeout(sock,5*60);
- //  sendtimeout(sock,5*60);
+   receivetimeout(sock,12);
+   sendtimeout(sock,15);
    sockopt(sock);
    int flag = 1;
    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
@@ -478,6 +562,9 @@ try {
       sslerror("SSL_accept: %s");
       return;
       }
+    // The rendezvous handlers intentionally wait for minutes after the
+    // request is complete. Only handshake and request framing are short-lived.
+    receivetimeout(sock,0);
     securewatchcommands(ssl,name.data());
    // LOGAR("below securewatchcommands");
    SSL_writeptr(ssl, "", 0);
@@ -581,6 +668,4 @@ if(SSL_CTX_use_PrivateKey_fileptr(ctx, private_file.data(), SSL_FILETYPE_PEM) <=
     globalctx=ctx;
     return "";
    }
-
-
 

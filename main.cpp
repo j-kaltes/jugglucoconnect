@@ -15,8 +15,8 @@ void startSSLonly();
 extern bool useSSL;
 int main(int argc,char **argv) {
    struct rlimit rl;
-   rl.rlim_cur = 100000;
-   rl.rlim_max = 100000;
+   rl.rlim_cur = 1024;
+   rl.rlim_max = 1024;
    if (setrlimit(RLIMIT_NPROC, &rl) < 0) {
        LOGGER("setrlimit(RLIMIT_NPROC failed %s\n",strerror(errno));
        }

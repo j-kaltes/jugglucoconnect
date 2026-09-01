@@ -10,8 +10,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY . .
-RUN make -j2 OPT=-O3 jugglucoconnect
+COPY Makefile *.cpp *.hpp *.h ./
+RUN make -j2 OPT='-O3 -DNOLOG' jugglucoconnect
 
 FROM debian:bookworm-slim
 

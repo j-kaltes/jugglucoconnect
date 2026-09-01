@@ -24,6 +24,9 @@ readable by that account. Compose refuses to start if either path is missing,
 so a typo cannot silently create a directory in place of a certificate file.
 The image disables the server's verbose SDP and ICE candidate logging, and
 Compose caps the remaining local container logs at two 1 MB files.
+The service also limits concurrent handlers, rendezvous state, processes,
+memory, and CPU. Certificate and key files are excluded from the image build
+context and are available only through the read-only runtime mounts.
 The host firewall only needs TCP port 6789:
 
 ```sh

@@ -3,3 +3,7 @@
 *.o
 jugglucoconnect
 stale_generation_test
+*.pem
+*.key
+fullchain.pem
+privkey.pem

@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <cstring>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -49,6 +51,7 @@ int main() {
 
     Agent_data *stale_done=Agent_data::newAgent('0',label,
         {old_description.data(),old_description.size()});
+    assert(stale_done);
     putdone(reinterpret_cast<const char *>(stale_done),stale_done->datalen(),
         {},&response,check,"test");
     assert(alldata.findEntry(label)==current_entry);
@@ -57,6 +60,7 @@ int main() {
 
     Agent_data *stale_failure=Agent_data::newAgent('0',label,
         {old_description.data(),old_description.size()});
+    assert(stale_failure);
     putfailure(reinterpret_cast<const char *>(stale_failure),stale_failure->datalen(),
         {},&response,"test");
     assert(alldata.findEntry(label)==current_entry);
@@ -65,5 +69,44 @@ int main() {
 
     assert(alldata.eraseEntry(label,current_entry));
     assert(!alldata.findEntry(label));
+
+    Agent_data *valid=Agent_data::newAgent('1',label,
+        {new_description.data(),new_description.size()});
+    assert(valid);
+    const std::span<const char> legacy_body(
+        reinterpret_cast<const char *>(valid),valid->datalen());
+    const auto legacy_view=AgentView::parse(legacy_body);
+    assert(legacy_view);
+    assert(legacy_view->getLabel()==label);
+    assert(legacy_view->getDescription().size()==new_description.size());
+    assert(AgentView::parse(legacy_body.first(
+        legacy_body.size()-AgentView::legacy_padding)));
+    assert(!AgentView::parse(legacy_body.first(legacy_body.size()-1)));
+
+    std::vector<char> malformed(legacy_body.begin(),legacy_body.end());
+    const int negative=-1;
+    memcpy(malformed.data(),&negative,sizeof(negative));
+    assert(!AgentView::parse(malformed));
+    malformed.assign(legacy_body.begin(),legacy_body.end());
+    malformed[sizeof(int)+sizeof(int)]='x';
+    assert(!AgentView::parse(malformed));
+
+    std::string request="PUT /failure HTTP/1.1\r\nContent-Length: "+
+        std::to_string(legacy_body.size())+"\r\n\r\n";
+    request.append(legacy_body.data(),legacy_body.size());
+    assert(watchcommands(request.data(),static_cast<int>(request.size()),
+        &response,true,check,"test"));
+    release_response(response);
+
+    std::string duplicate_length="PUT /failure HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n";
+    assert(!watchcommands(duplicate_length.data(),
+        static_cast<int>(duplicate_length.size()),&response,true,check,"test"));
+    release_response(response);
+
+    std::string mismatched_length="PUT /failure HTTP/1.1\r\nContent-Length: 8\r\n\r\n";
+    assert(!watchcommands(mismatched_length.data(),
+        static_cast<int>(mismatched_length.size()),&response,true,check,"test"));
+    release_response(response);
+    Agent_data::deleteAgent(valid);
     return 0;
 }
