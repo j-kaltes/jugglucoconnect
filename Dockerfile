@@ -11,7 +11,8 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY Makefile *.cpp *.hpp *.h ./
-RUN make -j2 OPT='-O3 -DNOLOG' jugglucoconnect
+COPY tests ./tests
+RUN make -j2 OPT='-O3 -DNOLOG' test jugglucoconnect
 
 FROM debian:bookworm-slim
 

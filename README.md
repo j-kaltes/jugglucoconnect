@@ -35,3 +35,20 @@ ufw allow 6789/tcp
 
 TURN traffic does not pass through this service. A TURN server such as coturn
 still needs its own listener and relay ports.
+
+## Optional peer generation watch
+
+Newer clients can use `PUT /generation` while ICE is negotiating. Each side
+registers a random generation token and waits for the other side's token to
+change. This lets a stale negotiation restart promptly when one phone has
+already moved to a newer ICE generation.
+
+The endpoint is an additive extension. Existing clients continue to use the
+original description, address, done, and failure endpoints. New clients treat
+the old server's bad-request response as an unsupported capability and carry
+on with the original protocol.
+
+Generation watches are intended for active negotiation only. The server keeps
+at most 48 generation labels, expires idle state after 15 minutes, and holds a
+watch for at most 45 seconds before the client renews it. Generation tokens,
+labels, SDP, and ICE candidates are not written to container logs.

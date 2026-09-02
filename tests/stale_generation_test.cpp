@@ -70,6 +70,65 @@ int main() {
     assert(alldata.eraseEntry(label,current_entry));
     assert(!alldata.findEntry(label));
 
+    constexpr std::string_view token_a="00112233445566778899aabbccddeeff";
+    constexpr std::string_view token_b="102132435465768798a9bacbdcedfe0f";
+    constexpr std::string_view token_c="ffeeddccbbaa99887766554433221100";
+    const auto parsed_token=parseGenerationRequest(
+        {token_a.data(),token_a.size()});
+    assert(parsed_token&&parsed_token->local==token_a&&
+           parsed_token->observedPeer.empty());
+    const std::string observed_request=std::string(token_b)+":"+std::string(token_a);
+    const auto parsed_observed=parseGenerationRequest(
+        {observed_request.data(),observed_request.size()});
+    assert(parsed_observed&&parsed_observed->local==token_b&&
+           parsed_observed->observedPeer==token_a);
+    constexpr std::string_view invalid_token="00112233445566778899aabbccddee-g";
+    assert(!parseGenerationRequest({invalid_token.data(),invalid_token.size()}));
+
+    GenerationStore generations(2,std::chrono::minutes(5));
+    GenerationRequest side_zero{std::string(token_a),{}};
+    GenerationRequest side_one{std::string(token_b),{}};
+    auto result=generations.observe(
+        "generation-test-label",0,side_zero,check,std::chrono::milliseconds(0));
+    assert(result.kind==GenerationResultKind::timeout);
+    result=generations.observe(
+        "generation-test-label",1,side_one,check,std::chrono::milliseconds(0));
+    assert(result.kind==GenerationResultKind::peer&&result.peer==token_a);
+
+    GenerationRequest wait_for_change{std::string(token_a),std::string(token_b)};
+    GenerationResult changed_result{GenerationResultKind::invalid,{}};
+    std::thread waiting_generation([&] {
+        changed_result=generations.observe(
+            "generation-test-label",0,wait_for_change,check,
+            std::chrono::seconds(2));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    GenerationRequest changed_peer{std::string(token_c),std::string(token_a)};
+    result=generations.observe(
+        "generation-test-label",1,changed_peer,check,std::chrono::milliseconds(0));
+    assert(result.kind==GenerationResultKind::timeout);
+    waiting_generation.join();
+    assert(changed_result.kind==GenerationResultKind::peer&&
+           changed_result.peer==token_c);
+
+    GenerationStore capacity_store(1,std::chrono::minutes(5));
+    assert(capacity_store.observe(
+        "generation-capacity-one",0,side_zero,check,
+        std::chrono::milliseconds(0)).kind==GenerationResultKind::timeout);
+    assert(capacity_store.observe(
+        "generation-capacity-two",0,side_zero,check,
+        std::chrono::milliseconds(0)).kind==GenerationResultKind::capacity);
+
+    GenerationStore expiring_store(1,std::chrono::milliseconds(1));
+    assert(expiring_store.observe(
+        "generation-expiry-one",0,side_zero,check,
+        std::chrono::milliseconds(0)).kind==GenerationResultKind::timeout);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    assert(expiring_store.observe(
+        "generation-expiry-two",0,side_zero,check,
+        std::chrono::milliseconds(0)).kind==GenerationResultKind::timeout);
+    assert(expiring_store.size()==1);
+
     Agent_data *valid=Agent_data::newAgent('1',label,
         {new_description.data(),new_description.size()});
     assert(valid);
@@ -97,6 +156,33 @@ int main() {
     assert(watchcommands(request.data(),static_cast<int>(request.size()),
         &response,true,check,"test"));
     release_response(response);
+
+    constexpr std::string_view endpoint_label="generation-endpoint-label";
+    assert(generationStore.observe(
+        endpoint_label,0,side_zero,check,
+        std::chrono::milliseconds(0)).kind==GenerationResultKind::timeout);
+    Agent_data *generation_body=Agent_data::newAgent(
+        '1',endpoint_label,{token_b.data(),token_b.size()});
+    assert(generation_body);
+    const std::span<const char> generation_span(
+        reinterpret_cast<const char *>(generation_body),
+        generation_body->datalen());
+    std::string generation_http="PUT /generation HTTP/1.1\r\nContent-Length: "+
+        std::to_string(generation_span.size())+"\r\n\r\n";
+    generation_http.append(generation_span.data(),generation_span.size());
+    assert(watchcommands(generation_http.data(),
+        static_cast<int>(generation_http.size()),&response,true,check,"test"));
+    const std::string_view generation_response(response.data(),response.size());
+    const size_t generation_header_end=generation_response.find("\r\n\r\n");
+    assert(generation_header_end!=std::string_view::npos);
+    const std::string_view generation_payload=
+        generation_response.substr(generation_header_end+4);
+    assert(generation_payload.size()==sizeof(BackDescription)+token_a.size()+1);
+    const auto *generation_back=reinterpret_cast<const BackDescription *>(
+        generation_payload.data());
+    assert(std::string_view(generation_back->description,token_a.size())==token_a);
+    release_response(response);
+    Agent_data::deleteAgent(generation_body);
 
     std::string duplicate_length="PUT /failure HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n";
     assert(!watchcommands(duplicate_length.data(),

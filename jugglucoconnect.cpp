@@ -20,6 +20,7 @@
 #define USE_SSL 1
 
 #include <assert.h>
+#include <cctype>
 #include <charconv>
 #include <type_traits>
 #include <inttypes.h>
@@ -51,6 +52,7 @@
 #include <chrono>
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 //#include <latch>
 
 #include "logs.hpp"
@@ -649,6 +651,7 @@ static bool getaddress(const char *input,int inputlen,std::string_view origin,re
 static bool putaddress(const char *input,int inputlen,std::string_view origin,recdata *outdata,const char *host);
 static bool putdone(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *host) ;
 static bool putfailure(const char *input,int inputlen,std::string_view origin,recdata *outdata,const char *host) ;
+static bool putgeneration(const char *input,int inputlen,std::string_view origin,recdata *outdata,valid_check &check,const char *host) ;
 bool watchcommands(char *rbuf,int len,recdata *outdata,bool secure,valid_check &check,const char *host) {
    static constexpr size_t max_request_size=4096;
    if(!rbuf||len<0||static_cast<size_t>(len)>max_request_size) {
@@ -773,6 +776,10 @@ bool watchcommands(char *rbuf,int len,recdata *outdata,bool secure,valid_check &
     if(toget=="failure") {
         if(beput)
             return putfailure(body,body_length,origin,outdata,host);
+        }
+    if(toget=="generation") {
+        if(beput)
+            return putgeneration(body,body_length,origin,outdata,check,host);
         }
    LOGGERALL("%s: wrong path %.*s\n",host,toget.size(),toget.data());
    wrongpath(toget,outdata);
@@ -1128,6 +1135,171 @@ bool eraseOnly(BaseMap::accessor &a)  {
      }
    };
 Alldata alldata;
+
+namespace {
+constexpr size_t generation_token_size=32;
+constexpr size_t max_generation_labels=48;
+constexpr auto generation_state_ttl=std::chrono::minutes(15);
+constexpr auto generation_watch_wait=std::chrono::seconds(45);
+
+struct GenerationRequest {
+    std::string local;
+    std::string observedPeer;
+};
+
+std::optional<GenerationRequest> parseGenerationRequest(std::span<const char> description) {
+    if(description.size()!=generation_token_size&&
+       description.size()!=generation_token_size*2+1)
+        return std::nullopt;
+    if(description.size()>generation_token_size&&description[generation_token_size]!=':')
+        return std::nullopt;
+    auto isHex=[](unsigned char value) {
+        return (value>='0'&&value<='9')||(value>='a'&&value<='f')||
+               (value>='A'&&value<='F');
+    };
+    for(size_t index=0;index<description.size();++index) {
+        if(index==generation_token_size&&description.size()>generation_token_size)
+            continue;
+        if(!isHex(static_cast<unsigned char>(description[index])))
+            return std::nullopt;
+    }
+    auto normalized=[](std::span<const char> token) {
+        std::string result(token.begin(),token.end());
+        std::transform(result.begin(),result.end(),result.begin(),[](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        return result;
+    };
+    GenerationRequest request{
+        normalized(description.first(generation_token_size)),{}};
+    if(description.size()>generation_token_size)
+        request.observedPeer=normalized(description.last(generation_token_size));
+    return request;
+}
+
+struct GenerationState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::array<std::string,2> tokens;
+    std::atomic<int64_t> lastTouchMilliseconds{0};
+};
+
+enum class GenerationResultKind { peer, timeout, invalid, capacity };
+struct GenerationResult {
+    GenerationResultKind kind;
+    std::string peer;
+};
+
+class GenerationStore {
+    const size_t capacity;
+    const std::chrono::milliseconds ttl;
+    mutable std::mutex mutex;
+    std::unordered_map<std::string,std::shared_ptr<GenerationState>> entries;
+
+    static int64_t nowMilliseconds() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void expireLocked(int64_t now,std::vector<std::shared_ptr<GenerationState>> &expired) {
+        for(auto entry=entries.begin();entry!=entries.end();) {
+            if(now-entry->second->lastTouchMilliseconds.load(std::memory_order_acquire)>
+               ttl.count()) {
+                expired.push_back(entry->second);
+                entry=entries.erase(entry);
+            }
+            else
+                ++entry;
+        }
+    }
+
+    bool isCurrent(std::string_view label,const std::shared_ptr<GenerationState> &expected) const {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto found=entries.find(std::string(label));
+        return found!=entries.end()&&found->second==expected;
+    }
+
+public:
+    explicit GenerationStore(
+        size_t capacity=max_generation_labels,
+        std::chrono::milliseconds ttl=generation_state_ttl)
+        :capacity(capacity),ttl(ttl) {}
+
+    GenerationResult observe(
+        std::string_view label,int side,const GenerationRequest &request,
+        valid_check &check,std::chrono::milliseconds wait=generation_watch_wait) {
+        if(side<0||side>1||label.size()<16||label.size()>AgentView::max_label_size)
+            return {GenerationResultKind::invalid,{}};
+        std::shared_ptr<GenerationState> state;
+        std::vector<std::shared_ptr<GenerationState>> expired;
+        bool atCapacity=false;
+        const int64_t now=nowMilliseconds();
+        {
+            const std::lock_guard<std::mutex> lock(mutex);
+            expireLocked(now,expired);
+            const auto found=entries.find(std::string(label));
+            if(found!=entries.end())
+                state=found->second;
+            else {
+                if(entries.size()>=capacity)
+                    atCapacity=true;
+                else {
+                    state=std::make_shared<GenerationState>();
+                    state->lastTouchMilliseconds.store(now,std::memory_order_release);
+                    entries.emplace(std::string(label),state);
+                }
+            }
+        }
+        for(const auto &entry:expired)
+            entry->changed.notify_all();
+        if(atCapacity)
+            return {GenerationResultKind::capacity,{}};
+
+        const int other=!side;
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->lastTouchMilliseconds.store(now,std::memory_order_release);
+        if(state->tokens[side]!=request.local) {
+            state->tokens[side]=request.local;
+            state->changed.notify_all();
+        }
+        const auto peerChanged=[&] {
+            return !state->tokens[other].empty()&&
+                   state->tokens[other]!=request.observedPeer;
+        };
+        if(!peerChanged()) {
+            state->changed.wait_for(lock,wait,[&] {
+                return peerChanged()||!check.valid()||!isCurrent(label,state);
+            });
+        }
+        state->lastTouchMilliseconds.store(nowMilliseconds(),std::memory_order_release);
+        if(!check.valid()||!isCurrent(label,state))
+            return {GenerationResultKind::invalid,{}};
+        if(peerChanged())
+            return {GenerationResultKind::peer,state->tokens[other]};
+        return {GenerationResultKind::timeout,{}};
+    }
+
+    size_t size() const {
+        const std::lock_guard<std::mutex> lock(mutex);
+        return entries.size();
+    }
+};
+
+GenerationStore generationStore;
+
+bool temporarilyUnavailable(recdata *outdata) {
+    static constexpr std::string_view response=
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: 3\r\n\r\n{}\n";
+    outdata->allbuf=nullptr;
+    outdata->start=response.data();
+    outdata->len=static_cast<int>(response.size());
+    return true;
+}
+}
+
 struct BackDescription {
     uint32_t was;
     char description[];
@@ -1152,6 +1324,39 @@ static void makeBackdescription(const address_t &descr,uint32_t oldtime,std::str
     back->description[deslen]='\0';
     mktypeheader(datastart,datastart+datalen,false,outdata,plain,origin);
     }
+
+static bool putgeneration(const char *input,int inputlen,std::string_view origin,
+                          recdata *outdata,valid_check &check,const char *name) {
+    const auto parsed=AgentView::parse(
+        {input,static_cast<size_t>(std::max(inputlen,0))});
+    if(!parsed||parsed->getLabel().size()<16) {
+        LOGGERALL("%s: putgeneration invalid request\n",name);
+        wrongpath("invalid generation request",outdata);
+        return true;
+    }
+    const auto generation=parseGenerationRequest(parsed->getDescription());
+    if(!generation) {
+        LOGGERALL("%s: putgeneration invalid token\n",name);
+        wrongpath("invalid generation token",outdata);
+        return true;
+    }
+    const auto result=generationStore.observe(
+        parsed->getLabel(),parsed->getWhere(),*generation,check);
+    switch(result.kind) {
+        case GenerationResultKind::peer: {
+            const address_t peer(static_cast<int>(result.peer.size()),result.peer.data());
+            makeBackdescription(peer,static_cast<uint32_t>(time(nullptr)),origin,outdata);
+            return true;
+        }
+        case GenerationResultKind::timeout:
+            return givenothing(outdata);
+        case GenerationResultKind::capacity:
+            return temporarilyUnavailable(outdata);
+        case GenerationResultKind::invalid:
+            return givenothing(outdata);
+    }
+    return givenothing(outdata);
+}
     /*
 int fd_valid(int sockfd) {
     int oldfl = fcntl(sockfd, F_GETFL);
