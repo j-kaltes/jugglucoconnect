@@ -2,6 +2,7 @@
 
 #ifndef LOGGERALL
 #include <time.h>
+#include <algorithm>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <stdarg.h>
@@ -28,16 +29,23 @@ inline  int mkstartlog(char *buf,const int maxbuf) {
 inline  int loggert(const char* fmt, ... )  {
     const int maxbuf=160;
     char buf[maxbuf];
-    int start=mkstartlog(buf,maxbuf);
+    int start=std::clamp(mkstartlog(buf,maxbuf),0,maxbuf-1);
     va_list args;
     va_start(args, fmt);
-    start+=vsnprintf(buf+start,maxbuf-start, fmt, args);
+    const int formatted=vsnprintf(buf+start,maxbuf-start, fmt, args);
     va_end(args);
+    if(formatted>0)
+        start+=std::min(formatted,maxbuf-start-1);
     write(STDERR_FILENO,buf,start);
     return start;
     }
+#ifdef NOLOG
+#define LOGGERALL(...) ((void)0)
+#define LOGARALL(...) ((void)0)
+#else
 #define LOGGERALL loggert
 #define LOGARALL(...) LOGGERALL("%s\n",__VA_ARGS__)
+#endif
 class Logstart {
 private:
   static  constexpr const int maxbuf=55;
@@ -63,11 +71,13 @@ inline void flerror(const char* fmt, ...){
     int waser=errno;
     const int maxbuf=160;
     char buf[maxbuf];
-    size_t start=mkstartlog(buf,maxbuf);
+    size_t start=static_cast<size_t>(std::clamp(mkstartlog(buf,maxbuf),0,maxbuf-1));
     va_list args;
     va_start(args, fmt);
-    start+=vsnprintf(buf+start,maxbuf-start, fmt, args);
+    const int formatted=vsnprintf(buf+start,maxbuf-start, fmt, args);
     va_end(args);
+    if(formatted>0)
+        start+=std::min(static_cast<size_t>(formatted),static_cast<size_t>(maxbuf)-start-1);
     static constexpr const char nl[]{"\n"};
     char *error=strerror(waser);
     size_t erlen=strlen(error);
